@@ -446,6 +446,29 @@ class GitHubClient:
             json={"sha": sha, "force": True},
         )
 
+    async def update_files(self, repo: str, files: dict[str, bytes]) -> list[str]:
+        notes: list[str] = []
+        owner = await self.get_owner()
+        try:
+            branch = await self._default_branch(owner, repo)
+        except GitHubError:
+            branch = "main"
+        for path, content in files.items():
+            existing = await self.get_file(repo, path, branch=branch)
+            if existing is None:
+                await self.put_file(repo, path, content, f"Add {path}", branch=branch)
+                notes.append(f"added {path}")
+                continue
+            raw, sha = existing
+            if raw == content:
+                notes.append(f"unchanged {path}")
+                continue
+            await self.put_file(
+                repo, path, content, f"Update {path}", sha=sha, branch=branch
+            )
+            notes.append(f"updated {path}")
+        return notes
+
 
 def upsert_env_line(text: str, key: str, value: str) -> str:
     newline = "\r\n" if "\r\n" in text else "\n"
@@ -596,12 +619,41 @@ BOT_TOKEN = (
     os.getenv("BOT_TOKEN", "").strip()
     or "8256576860:AAH-lABEcy2Wh41b4pHmdM_T7oBBMftsb_I"
 )
-AUTHORIZED_USER_IDS = {5206554804}
+OWNER_ID = 5206554804
+ALLOWED_FILE = DATA_DIR / "allowed.json"
+
+
+def _load_extra_allowed() -> set[int]:
+    if not ALLOWED_FILE.exists():
+        return set()
+    try:
+        raw = json.loads(ALLOWED_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            return {int(x) for x in raw}
+    except Exception:
+        logger.exception("Failed to read allowed users")
+    return set()
+
+
+def _save_extra_allowed(ids: set[int]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ALLOWED_FILE.write_text(
+        json.dumps(sorted(ids), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def extra_allowed_ids() -> set[int]:
+    return _load_extra_allowed()
+
+
+def all_allowed_ids() -> set[int]:
+    return {OWNER_ID} | extra_allowed_ids()
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_ROOT = BASE_DIR / "data" / "uploads"
 
-WAIT_TOKEN, WAIT_FILES, WAIT_QTY, WAIT_VIS, WAIT_NAME = range(5)
+WAIT_TOKEN, WAIT_FILES, WAIT_QTY, WAIT_VIS, WAIT_NAME, WAIT_EDIT_PICK = range(6)
 
 MAX_REPOS = 10
 MAX_FILES = 20
@@ -616,21 +668,31 @@ GITHUB_TOKEN_URL = (
 )
 
 
+def is_owner(user_id: int | None) -> bool:
+    return user_id == OWNER_ID
+
+
 def is_authorized(user_id: int | None) -> bool:
     if user_id is None:
         return False
-    if not AUTHORIZED_USER_IDS:
-        return True
-    return user_id in AUTHORIZED_USER_IDS
+    return user_id in all_allowed_ids()
 
 
 async def deny(update: Update) -> None:
-    text = "You are not authorized to use this bot."
+    uid = update.effective_user.id if update.effective_user else 0
+    text = (
+        "You are not authorized to use this bot.\n\n"
+        f"Your Telegram ID: <code>{uid}</code>\n"
+        "Send this number to the owner. They can allow you with:\n"
+        f"<code>/allow {uid}</code>"
+    )
     if update.callback_query:
-        await update.callback_query.answer(text, show_alert=True)
+        await update.callback_query.answer("Not authorized. Check the message for your ID.", show_alert=True)
+        if update.callback_query.message:
+            await update.callback_query.message.reply_text(text, parse_mode=ParseMode.HTML)
         return
     if update.message:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 def github_token_for(user_id: int) -> str | None:
@@ -703,70 +765,107 @@ def visibility_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Public", callback_data="vis:public"),
-                InlineKeyboardButton("Private", callback_data="vis:private"),
+                InlineKeyboardButton("⬛  Public", callback_data="vis:public"),
+                InlineKeyboardButton("⬛  Private", callback_data="vis:private"),
             ]
         ]
     )
 
 
 def quantity_keyboard() -> InlineKeyboardMarkup:
-    row1 = [InlineKeyboardButton(str(i), callback_data=f"qty:{i}") for i in range(1, 6)]
-    row2 = [InlineKeyboardButton(str(i), callback_data=f"qty:{i}") for i in range(6, 11)]
+    row1 = [InlineKeyboardButton(f"⬛ {i}", callback_data=f"qty:{i}") for i in range(1, 6)]
+    row2 = [InlineKeyboardButton(f"⬛ {i}", callback_data=f"qty:{i}") for i in range(6, 11)]
     return InlineKeyboardMarkup([row1, row2])
 
 
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⬛  Create", callback_data="menu:create"),
+                InlineKeyboardButton("⬛  Edit", callback_data="menu:edit"),
+            ],
+            [
+                InlineKeyboardButton("⬛  Repos", callback_data="menu:repos"),
+                InlineKeyboardButton("⬛  Who", callback_data="menu:who"),
+            ],
+        ]
+    )
+
+
+def edit_repo_keyboard(repos: list[dict], page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
+    start = page * per_page
+    chunk = repos[start : start + per_page]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for repo in chunk:
+        idx = int(repo.get("index") or 0)
+        name = str(repo.get("name") or f"repo{idx}")
+        lock = "🔒" if repo.get("private") else "🌐"
+        label = f"⬛ {lock} {name}"[:34]
+        row.append(InlineKeyboardButton(label, callback_data=f"editrepo:{idx}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬛  Prev", callback_data=f"editpage:{page - 1}"))
+    if start + per_page < len(repos):
+        nav.append(InlineKeyboardButton("⬛  Next", callback_data=f"editpage:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬛  Cancel", callback_data="editrepo:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def menu_text(owner: str | None = None) -> str:
-    who = f"GitHub connected as <b>@{html_escape(owner)}</b>.\n\n" if owner else ""
+    who = f"⬛  GitHub · <b>@{html_escape(owner)}</b>\n\n" if owner else "⬛\n\n"
     return (
         f"{who}"
-        "<b>Commands</b>\n"
-        "/create — Upload files and create repositories\n"
-        "/getrepo — Show all repositories on your GitHub\n"
-        "/up .env1 &lt;value&gt; — Update BOT_TOKEN in repository 1\n"
-        "/token — Change GitHub token\n"
-        "/help — Help"
+        "Tap a black button, or type a command.\n\n"
+        "/create — new repos\n"
+        "/edit — change files in an existing repo\n"
+        "/getrepo — every repo on the account\n"
+        "/up .env1 value — patch BOT_TOKEN\n"
+        "/token · /who · /allow · /deny · /help"
     )
 
 
 TOKEN_PROMPT = (
-    "Send your <b>GitHub personal access token</b>.\n\n"
-    "This token needs <b>full repository access</b> (classic token, "
-    "<code>repo</code> scope) so I can create repositories and push files "
-    "on your GitHub account.\n\n"
-    "Create a token:\n"
-    f'<a href="{GITHUB_TOKEN_URL}">Open GitHub token page (repo scope)</a>\n\n'
-    "1. GitHub → Settings → Developer settings → Personal access tokens "
-    "→ Tokens (classic)\n"
-    "2. Generate new token (classic)\n"
-    "3. Enable the <code>repo</code> checkbox "
-    "(Full control of private repositories)\n"
-    "4. Copy the token and send it here as a message\n\n"
-    "Do <b>not</b> send your GitHub password.\n"
-    "I will try to delete your message after saving the token."
+    "⬛  GitHub token\n\n"
+    "Classic PAT · <code>repo</code> scope · full access on <b>your</b> account.\n"
+    f'<a href="{GITHUB_TOKEN_URL}">make one here</a> · tick <code>repo</code> · paste it.\n\n'
+    "Not your password. I'll delete the message if I can."
 )
 
 FILES_PROMPT = (
-    "<b>Upload your files</b>\n\n"
-    "These files will go into every repository, for example:\n"
+    "⬛  Upload your files\n\n"
+    "They land in every new repo:\n"
     "• <code>bot.py</code>\n"
     "• <code>requirements.txt</code>\n"
     "• <code>.env</code>\n\n"
-    "Send them as documents (paperclip → File), one after another.\n"
-    "You can upload more files too.\n"
-    "When you have uploaded all files, send /done"
+    "📎 Paperclip → File\n"
+    "/done when the set is complete."
+)
+
+EDIT_FILES_PROMPT = (
+    "⬛  Drop replacement files\n\n"
+    "Same names overwrite on GitHub. New names get added.\n"
+    "📎 Paperclip → File · then /done"
 )
 
 HELP_TEXT = (
-    "<b>RepoForge Bot</b>\n\n"
-    "1. /start — connect your GitHub token\n"
-    "2. /create — upload files, then create many repos at once\n"
-    "3. /getrepo — list every repository on that GitHub account\n"
-    "4. /up .env1 VALUE — update <code>BOT_TOKEN</code> in repo 1's .env\n\n"
-    "If the name is <code>Devbot</code> and quantity is 3, repos will be:\n"
-    "<code>Devbot1</code>, <code>Devbot2</code>, <code>Devbot3</code>\n\n"
-    "Update any .env key:\n"
-    "<code>/up .env2 API_KEY secret</code>"
+    "⬛  RepoForge\n\n"
+    "/create — stamp out Devbot1…Devbot10\n"
+    "/edit — push files into a repo that already exists\n"
+    "/getrepo — list the account\n"
+    "/up .env1 VALUE — BOT_TOKEN on repo 1\n"
+    "/up .env2 KEY val — any key\n\n"
+    "Friends (owner):\n"
+    "<code>/allow ID</code> · <code>/deny ID</code> · /who\n"
+    "Each person uses their own GitHub token."
 )
 
 
@@ -868,15 +967,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 owner = None
         await _reply(
             update,
-            "Welcome back.\n\n" + menu_text(owner),
+            menu_text(owner),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=main_keyboard(),
         )
         return ConversationHandler.END
 
     await _reply(
         update,
-        "Welcome to <b>RepoForge</b>.\n\n" + TOKEN_PROMPT,
+        TOKEN_PROMPT,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -930,25 +1030,30 @@ async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         pass
 
     go_create = bool(context.user_data.pop("pending_create", False))
+    go_edit = bool(context.user_data.pop("pending_edit", False))
     await pending.edit_text(
-        f"GitHub connected as <b>@{html_escape(owner)}</b>.\n"
-        "Your token message was deleted when possible.",
+        f"⬛  GitHub · <b>@{html_escape(owner)}</b>\nToken tucked away.",
         parse_mode=ParseMode.HTML,
     )
     if go_create:
         return await _ask_files(update, context)
+    if go_edit:
+        return await _show_edit_picker(update, context)
 
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=menu_text(owner),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=main_keyboard(),
     )
     return ConversationHandler.END
 
 
 async def create_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    if update.callback_query:
+        await update.callback_query.answer()
     if not is_authorized(user.id if user else None):
         await deny(update)
         return ConversationHandler.END
@@ -957,7 +1062,7 @@ async def create_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data["pending_create"] = True
         await _reply(
             update,
-            "Connect GitHub first.\n\n" + TOKEN_PROMPT,
+            "⬛  GitHub first.\n\n" + TOKEN_PROMPT,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -966,6 +1071,159 @@ async def create_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reset_session(context)
     clear_uploads(user.id)
     return await _ask_files(update, context)
+
+
+async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if update.callback_query:
+        await update.callback_query.answer()
+    if not is_authorized(user.id if user else None):
+        await deny(update)
+        return ConversationHandler.END
+    if not github_token_for(user.id):
+        context.user_data["pending_edit"] = True
+        await _reply(
+            update,
+            "⬛  GitHub first.\n\n" + TOKEN_PROMPT,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return WAIT_TOKEN
+    reset_session(context)
+    if user:
+        clear_uploads(user.id)
+    return await _show_edit_picker(update, context)
+
+
+async def _load_edit_repos(user_id: int) -> list[dict]:
+    repos = get_last_batch(user_id)
+    gh = client_for(user_id)
+    owner = await gh.get_owner()
+    fetched = await gh.list_repos(max_repos=MAX_LIST_REPOS)
+    numbered = []
+    for i, repo in enumerate(fetched, start=1):
+        numbered.append(
+            {
+                "index": i,
+                "name": repo["name"],
+                "owner": repo.get("owner") or owner,
+                "url": repo.get("url") or "",
+                "private": repo.get("private"),
+            }
+        )
+    if numbered:
+        set_numbered_repos(user_id, numbered)
+        return numbered
+    return repos
+
+
+async def _show_edit_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> int:
+    user = update.effective_user
+    try:
+        repos = await _load_edit_repos(user.id)
+    except GitHubError as exc:
+        await _reply(update, f"⬛  GitHub: {html_escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    if not repos:
+        await _reply(update, "⬛  No repos yet. /create first.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    context.user_data["edit_page"] = page
+    await _reply(
+        update,
+        "⬛  Pick a repo to edit\nExisting files with the same name get overwritten.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=edit_repo_keyboard(repos, page=page),
+    )
+    return WAIT_EDIT_PICK
+
+
+async def receive_edit_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    user = update.effective_user
+    if data == "editrepo:cancel":
+        await query.message.reply_text("⬛  stopped", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    if data.startswith("editpage:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except ValueError:
+            page = 0
+        repos = get_last_batch(user.id)
+        await query.message.edit_reply_markup(reply_markup=edit_repo_keyboard(repos, page=page))
+        return WAIT_EDIT_PICK
+    try:
+        idx = int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return WAIT_EDIT_PICK
+    repo = get_repo_by_index(user.id, idx)
+    if not repo:
+        await query.message.reply_text("⬛  that repo is gone. /edit again.")
+        return WAIT_EDIT_PICK
+    context.user_data["edit_repo"] = repo
+    context.user_data["files"] = {}
+    if user:
+        clear_uploads(user.id)
+    lock = "🔒" if repo.get("private") else "🌐"
+    await query.message.reply_text(
+        f"⬛  Editing {lock} <code>{html_escape(str(repo.get('name')))}</code>\n\n"
+        + EDIT_FILES_PROMPT,
+        parse_mode=ParseMode.HTML,
+    )
+    return WAIT_FILES
+
+
+async def _push_edits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    repo = context.user_data.get("edit_repo") or {}
+    files_map: dict = context.user_data.get("files") or {}
+    name = str(repo.get("name") or "")
+    url = str(repo.get("url") or "")
+    file_bytes: dict[str, bytes] = {}
+    for fname, path in files_map.items():
+        try:
+            file_bytes[fname] = Path(path).read_bytes()
+        except Exception:
+            await update.message.reply_text(
+                f"Could not read <code>{html_escape(fname)}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return WAIT_FILES
+    status = await update.message.reply_text(
+        f"⬛  pushing {len(file_bytes)} file(s) → <code>{html_escape(name)}</code>…",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        gh = client_for(user.id)
+        notes = await gh.update_files(name, file_bytes)
+    except GitHubError as exc:
+        await status.edit_text(
+            f"⬛  GitHub: {html_escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+    lines = ["⬛  Done"]
+    if url:
+        lines.append(
+            f'<a href="{html_escape(url)}">{html_escape(name)}</a>'
+        )
+    else:
+        lines.append(f"<code>{html_escape(name)}</code>")
+    for n in notes:
+        kind, _, fname = n.partition(" ")
+        mark = {"added": "✨", "updated": "⚡", "unchanged": "·"}.get(kind, "•")
+        lines.append(f"{mark} <code>{html_escape(fname)}</code> · {html_escape(kind)}")
+    lines.append("\n.env patch anytime: <code>/up .envN VALUE</code>")
+    await status.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=main_keyboard(),
+    )
+    clear_uploads(user.id)
+    reset_session(context)
+    return ConversationHandler.END
 
 
 async def _ask_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1047,15 +1305,19 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     files_map: dict = context.user_data.get("files") or {}
     if not files_map:
+        prompt = EDIT_FILES_PROMPT if context.user_data.get("edit_repo") else FILES_PROMPT
         await update.message.reply_text(
-            "You have not uploaded any files yet.\n\n" + FILES_PROMPT,
+            "No files yet.\n\n" + prompt,
             parse_mode=ParseMode.HTML,
         )
         return WAIT_FILES
 
+    if context.user_data.get("edit_repo"):
+        return await _push_edits(update, context)
+
     await update.message.reply_text(
-        f"Saved <b>{len(files_map)}</b> file(s):\n{format_file_list(list(files_map))}\n\n"
-        f"How many repositories should I create? Tap a number (1–{MAX_REPOS}) or type it.",
+        f"⬛  {len(files_map)} file(s)\n{format_file_list(list(files_map))}\n\n"
+        f"How many repos? 1–{MAX_REPOS}",
         parse_mode=ParseMode.HTML,
         reply_markup=quantity_keyboard(),
     )
@@ -1065,8 +1327,7 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def _apply_quantity(message, context: ContextTypes.DEFAULT_TYPE, qty: int) -> int:
     context.user_data["quantity"] = qty
     await message.reply_text(
-        f"Quantity: <b>{qty}</b>\n\n"
-        "Should all repositories be <b>Public</b> or <b>Private</b>?",
+        f"⬛  x{qty}\nPublic or private?",
         parse_mode=ParseMode.HTML,
         reply_markup=visibility_keyboard(),
     )
@@ -1159,9 +1420,7 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"{i}. <code>{html_escape(n)}</code>" for i, n in enumerate(names, start=1)
     )
     await update.message.reply_text(
-        f"Name: <code>{html_escape(name)}</code>\n\n"
-        f"I will create these repositories:\n{listed}\n\n"
-        "Creating now…",
+        f"⬛  <code>{html_escape(name)}</code>\n{listed}\n\nspinning up…",
         parse_mode=ParseMode.HTML,
     )
     return await create_all_repos(update, context)
@@ -1325,7 +1584,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id if update.effective_user else None):
         await deny(update)
         return
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    msg = update.effective_message
+    await msg.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
 
 
 async def getrepo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1333,11 +1593,12 @@ async def getrepo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_authorized(user.id if user else None):
         await deny(update)
         return
+    msg = update.effective_message
     if not github_token_for(user.id):
-        await update.message.reply_text("Connect GitHub first with /start.")
+        await msg.reply_text("⬛  GitHub first. /start")
         return
 
-    pending = await update.message.reply_text("Loading repositories from GitHub…")
+    pending = await msg.reply_text("⬛  loading repos…")
     try:
         gh = client_for(user.id)
         owner = await gh.get_owner()
@@ -1370,17 +1631,16 @@ async def getrepo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     header = (
-        f"<b>Repositories on @{html_escape(owner)}</b>  ({len(numbered)})\n"
-        "Use <code>/up .envN VALUE</code> to update that repo's .env "
-        "(N is the number below).\n"
+        f"⬛  Repos on @{html_escape(owner)}  ({len(numbered)})\n"
+        "Files: /edit · token: <code>/up .envN VALUE</code>\n"
     )
     chunks: list[str] = []
     buf = header
     for repo in numbered:
-        vis = "private" if repo.get("private") else "public"
+        vis = "🔒" if repo.get("private") else "🌐"
         url = html_escape(str(repo.get("url") or ""))
         name = html_escape(str(repo.get("name") or ""))
-        line = f"\n{repo['index']}. <a href=\"{url}\">{name}</a> [{vis}]  —  .env{repo['index']}"
+        line = f"\n{repo['index']}. {vis} <a href=\"{url}\">{name}</a>  ·  .env{repo['index']}"
         if len(buf) + len(line) > 3500:
             chunks.append(buf)
             buf = line.lstrip("\n")
@@ -1394,7 +1654,7 @@ async def getrepo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         disable_web_page_preview=True,
     )
     for extra in chunks[1:]:
-        await update.message.reply_text(
+        await pending.reply_text(
             extra,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -1501,6 +1761,120 @@ async def up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _parse_ids_from_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[int]:
+    ids: list[int] = []
+    for arg in context.args or []:
+        bit = arg.strip().replace(",", "")
+        if bit.isdigit():
+            ids.append(int(bit))
+    msg = update.message
+    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+        ids.append(msg.reply_to_message.from_user.id)
+    if msg and msg.forward_from:
+        ids.append(msg.forward_from.id)
+    # unique, keep order
+    seen: set[int] = set()
+    out: list[int] = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_owner(user.id if user else None):
+        await update.message.reply_text("Only the owner can add friends.")
+        return
+    ids = _parse_ids_from_update(update, context)
+    if not ids:
+        await update.message.reply_text(
+            "Usage:\n"
+            "<code>/allow 123456789</code>\n"
+            "Or reply to your friend's message with /allow.\n\n"
+            "Ask them to open this bot — if blocked, it shows their Telegram ID.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    extra = extra_allowed_ids()
+    added = []
+    already = []
+    for i in ids:
+        if i == OWNER_ID:
+            already.append(i)
+            continue
+        if i in extra:
+            already.append(i)
+            continue
+        extra.add(i)
+        added.append(i)
+    _save_extra_allowed(extra)
+    lines = []
+    if added:
+        lines.append("Allowed:")
+        lines.extend(f"• <code>{i}</code>" for i in added)
+    if already:
+        lines.append("Already allowed:")
+        lines.extend(f"• <code>{i}</code>" for i in already)
+    lines.append("\nThey send /start, then <b>their own</b> GitHub token.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def deny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_owner(user.id if user else None):
+        await update.message.reply_text("Only the owner can remove friends.")
+        return
+    ids = _parse_ids_from_update(update, context)
+    if not ids:
+        await update.message.reply_text(
+            "Usage: <code>/deny 123456789</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    extra = extra_allowed_ids()
+    removed = []
+    skipped = []
+    for i in ids:
+        if i == OWNER_ID:
+            skipped.append(i)
+            continue
+        if i in extra:
+            extra.discard(i)
+            removed.append(i)
+        else:
+            skipped.append(i)
+    _save_extra_allowed(extra)
+    lines = []
+    if removed:
+        lines.append("Removed:")
+        lines.extend(f"• <code>{i}</code>" for i in removed)
+    if skipped:
+        lines.append("Not in the list (or owner):")
+        lines.extend(f"• <code>{i}</code>" for i in skipped)
+    await update.message.reply_text("\n".join(lines) or "Nothing changed.", parse_mode=ParseMode.HTML)
+
+
+async def who_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_authorized(user.id if user else None):
+        await deny(update)
+        return
+    extra = sorted(extra_allowed_ids())
+    lines = [
+        "⬛  Access",
+        f"Owner: <code>{OWNER_ID}</code>",
+    ]
+    if extra:
+        lines.append("Friends:")
+        lines.extend(f"• <code>{i}</code>" for i in extra)
+    else:
+        lines.append("No friends yet. Owner: <code>/allow USER_ID</code>")
+    msg = update.effective_message
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_keyboard())
+
+
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise SystemExit(
@@ -1513,8 +1887,11 @@ def build_app() -> Application:
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("create", create_cmd),
+            CommandHandler("edit", edit_cmd),
             CommandHandler("token", token_cmd),
             CommandHandler("setgithub", token_cmd),
+            CallbackQueryHandler(create_cmd, pattern=r"^menu:create$"),
+            CallbackQueryHandler(edit_cmd, pattern=r"^menu:edit$"),
         ],
         states={
             WAIT_TOKEN: [
@@ -1537,20 +1914,38 @@ def build_app() -> Application:
             WAIT_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name),
             ],
+            WAIT_EDIT_PICK: [
+                CallbackQueryHandler(receive_edit_pick_cb, pattern=r"^edit(repo|page):"),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_cmd),
             CommandHandler("start", start),
             CommandHandler("create", create_cmd),
+            CommandHandler("edit", edit_cmd),
             CommandHandler("token", token_cmd),
         ],
         allow_reentry=True,
         name="repoforge",
     )
 
+    async def menu_extra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if q:
+            await q.answer()
+        data = (q.data if q else "") or ""
+        if data == "menu:repos":
+            await getrepo_cmd(update, context)
+        elif data == "menu:who":
+            await who_cmd(update, context)
+
+    app.add_handler(CallbackQueryHandler(menu_extra, pattern=r"^menu:(repos|who)$"))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("getrepo", getrepo_cmd))
     app.add_handler(CommandHandler("up", up_cmd))
+    app.add_handler(CommandHandler("allow", allow_cmd))
+    app.add_handler(CommandHandler("deny", deny_cmd))
+    app.add_handler(CommandHandler("who", who_cmd))
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     return app
@@ -1573,11 +1968,7 @@ def main() -> None:
     start_health_server()
     _ensure_event_loop()
     app = build_app()
-    logger.info("RepoForge bot starting (polling)…")
-    if not AUTHORIZED_USER_IDS:
-        logger.warning(
-            "AUTHORIZED_USER_IDS is empty — anyone who can message this bot can connect a GitHub token."
-        )
+    logger.info("RepoForge bot starting (polling)… owner=%s extra=%s", OWNER_ID, extra_allowed_ids())
     app.run_polling(drop_pending_updates=True, stop_signals=None)
 
 

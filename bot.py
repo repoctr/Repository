@@ -623,24 +623,39 @@ OWNER_ID = 5206554804
 ALLOWED_FILE = DATA_DIR / "allowed.json"
 
 
+def _allowed_paths() -> list[Path]:
+    return [DATA_DIR / "allowed.json", Path("/tmp/repoforge-data") / "allowed.json"]
+
+
 def _load_extra_allowed() -> set[int]:
-    if not ALLOWED_FILE.exists():
-        return set()
-    try:
-        raw = json.loads(ALLOWED_FILE.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            return {int(x) for x in raw}
-    except Exception:
-        logger.exception("Failed to read allowed users")
-    return set()
+    ids: set[int] = set()
+    for path in _allowed_paths():
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                ids.update(int(x) for x in raw)
+        except Exception:
+            logger.exception("Failed to read %s", path)
+    return ids
 
 
 def _save_extra_allowed(ids: set[int]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ALLOWED_FILE.write_text(
-        json.dumps(sorted(ids), indent=2) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(sorted(ids), indent=2) + "\n"
+    last: Exception | None = None
+    for folder in (DATA_DIR, Path("/tmp/repoforge-data")):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / "allowed.json"
+            path.write_text(payload, encoding="utf-8")
+            global ALLOWED_FILE
+            ALLOWED_FILE = path
+            return
+        except Exception as exc:
+            last = exc
+            logger.warning("Could not write allowed list to %s: %s", folder, exc)
+    raise OSError(f"Could not save allowed users: {last}")
 
 
 def extra_allowed_ids() -> set[int]:
@@ -1764,15 +1779,17 @@ async def up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _parse_ids_from_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[int]:
     ids: list[int] = []
     for arg in context.args or []:
-        bit = arg.strip().replace(",", "")
-        if bit.isdigit():
+        bit = re.sub(r"[^\d]", "", arg)
+        if bit.isdigit() and len(bit) >= 5:
             ids.append(int(bit))
-    msg = update.message
+    msg = update.effective_message
+    text = (msg.text or msg.caption or "") if msg else ""
+    for bit in re.findall(r"\d{5,}", text):
+        ids.append(int(bit))
     if msg and msg.reply_to_message and msg.reply_to_message.from_user:
         ids.append(msg.reply_to_message.from_user.id)
     if msg and msg.forward_from:
         ids.append(msg.forward_from.id)
-    # unique, keep order
     seen: set[int] = set()
     out: list[int] = []
     for i in ids:
@@ -1783,53 +1800,59 @@ def _parse_ids_from_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
     user = update.effective_user
-    if not is_owner(user.id if user else None):
-        await update.message.reply_text("Only the owner can add friends.")
-        return
-    ids = _parse_ids_from_update(update, context)
-    if not ids:
-        await update.message.reply_text(
-            "Usage:\n"
-            "<code>/allow 123456789</code>\n"
-            "Or reply to your friend's message with /allow.\n\n"
-            "Ask them to open this bot — if blocked, it shows their Telegram ID.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    extra = extra_allowed_ids()
-    added = []
-    already = []
-    for i in ids:
-        if i == OWNER_ID:
-            already.append(i)
-            continue
-        if i in extra:
-            already.append(i)
-            continue
-        extra.add(i)
-        added.append(i)
-    _save_extra_allowed(extra)
-    lines = []
-    if added:
-        lines.append("Allowed:")
-        lines.extend(f"• <code>{i}</code>" for i in added)
-    if already:
-        lines.append("Already allowed:")
-        lines.extend(f"• <code>{i}</code>" for i in already)
-    lines.append("\nThey send /start, then <b>their own</b> GitHub token.")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    try:
+        if not is_owner(user.id if user else None):
+            await msg.reply_text("⬛  Only the owner can add friends.")
+            return
+        ids = _parse_ids_from_update(update, context)
+        if not ids:
+            await msg.reply_text(
+                "⬛  Send it like this:\n"
+                "<code>/allow 123456789</code>\n"
+                "Or reply to their message with /allow.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        extra = extra_allowed_ids()
+        added = []
+        already = []
+        for i in ids:
+            if i == OWNER_ID or i in extra:
+                already.append(i)
+                continue
+            extra.add(i)
+            added.append(i)
+        _save_extra_allowed(extra)
+        lines = ["⬛  Access updated"]
+        if added:
+            lines.append("Allowed:")
+            lines.extend(f"• <code>{i}</code>" for i in added)
+        if already:
+            lines.append("Already in:")
+            lines.extend(f"• <code>{i}</code>" for i in already)
+        lines.append("\nThey tap /start, then paste <b>their</b> GitHub token.")
+        await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.exception("allow_cmd failed")
+        await msg.reply_text(f"⬛  /allow failed: {html_escape(str(exc))}", parse_mode=ParseMode.HTML)
 
 
 async def deny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    msg = update.effective_message
+    if not msg:
+        return
     if not is_owner(user.id if user else None):
-        await update.message.reply_text("Only the owner can remove friends.")
+        await msg.reply_text("⬛  Only the owner can remove friends.")
         return
     ids = _parse_ids_from_update(update, context)
     if not ids:
-        await update.message.reply_text(
-            "Usage: <code>/deny 123456789</code>",
+        await msg.reply_text(
+            "⬛  <code>/deny 123456789</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1939,15 +1962,19 @@ def build_app() -> Application:
         elif data == "menu:who":
             await who_cmd(update, context)
 
+    always = [
+        ("allow", allow_cmd),
+        ("deny", deny_cmd),
+        ("who", who_cmd),
+        ("help", help_cmd),
+        ("getrepo", getrepo_cmd),
+        ("up", up_cmd),
+        ("cancel", cancel_cmd),
+    ]
+    for name, fn in always:
+        app.add_handler(CommandHandler(name, fn), group=-1)
     app.add_handler(CallbackQueryHandler(menu_extra, pattern=r"^menu:(repos|who)$"))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("getrepo", getrepo_cmd))
-    app.add_handler(CommandHandler("up", up_cmd))
-    app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler("deny", deny_cmd))
-    app.add_handler(CommandHandler("who", who_cmd))
     app.add_handler(conv)
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
     return app
 
 

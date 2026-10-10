@@ -1788,8 +1788,13 @@ def _parse_ids_from_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ids.append(int(bit))
     if msg and msg.reply_to_message and msg.reply_to_message.from_user:
         ids.append(msg.reply_to_message.from_user.id)
-    if msg and msg.forward_from:
-        ids.append(msg.forward_from.id)
+    fwd = getattr(msg, "forward_from", None) if msg else None
+    if fwd is not None and getattr(fwd, "id", None):
+        ids.append(fwd.id)
+    origin = getattr(msg, "forward_origin", None) if msg else None
+    sender = getattr(origin, "sender_user", None) if origin is not None else None
+    if sender is not None and getattr(sender, "id", None):
+        ids.append(sender.id)
     seen: set[int] = set()
     out: list[int] = []
     for i in ids:

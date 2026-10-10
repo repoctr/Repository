@@ -1676,6 +1676,32 @@ async def getrepo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
 
+def _parse_up_payload(payload: str) -> tuple[str, str]:
+    """Accept /up .envN TOKEN  or  /up .envN BOT_TOKEN=TOKEN  or  /up .envN KEY value."""
+    payload = (payload or "").strip()
+    if not payload:
+        return "BOT_TOKEN", ""
+    if "=" in payload:
+        left, right = payload.split("=", 1)
+        left = left.strip()
+        if ENV_KEY_RE.match(left):
+            key, value = left, right.strip()
+        else:
+            key, value = "BOT_TOKEN", payload
+    else:
+        bits = payload.split(None, 1)
+        if len(bits) == 2 and ENV_KEY_RE.match(bits[0]):
+            key, value = bits[0], bits[1].strip()
+        else:
+            key, value = "BOT_TOKEN", payload
+    prefix = key + "="
+    while value.startswith(prefix):
+        value = value[len(prefix) :].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    return key, value
+
+
 async def up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not is_authorized(user.id if user else None):
@@ -1684,11 +1710,12 @@ async def up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     usage = (
         "<b>Usage</b>\n"
-        "<code>/up .env1 YOUR_BOT_TOKEN</code>\n"
-        "Updates <code>BOT_TOKEN</code> in repository 1's .env file.\n\n"
-        "<code>/up .env2 KEY value</code>\n"
-        "Updates any key in repository 2's .env file.\n\n"
-        "Numbers come from the last /create batch, or from /getrepo."
+        "<code>/up .env1 123456:AAF...</code>\n"
+        "or <code>/up .env1 BOT_TOKEN=123456:AAF...</code>\n"
+        "Writes only <code>BOT_TOKEN=123456:AAF...</code> (no double key).\n\n"
+        "<code>/up .env2 API_KEY secret</code>\n"
+        "Any other key.\n\n"
+        "Numbers come from /create or /getrepo."
     )
 
     text = (update.message.text or "").strip()
@@ -1712,17 +1739,8 @@ async def up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Repository number must be 1 or higher.")
         return
 
-    rest_parts = parts[2:]
-    if len(rest_parts) >= 2 and ENV_KEY_RE.match(rest_parts[0]):
-        key = rest_parts[0]
-        split3 = text.split(maxsplit=3)
-        value = split3[3] if len(split3) > 3 else ""
-    else:
-        key = "BOT_TOKEN"
-        split2 = text.split(maxsplit=2)
-        value = split2[2] if len(split2) > 2 else ""
-
-    value = value.strip()
+    payload = text.split(maxsplit=2)[2].strip() if len(text.split(maxsplit=2)) > 2 else ""
+    key, value = _parse_up_payload(payload)
     if not value:
         await update.message.reply_text("Missing value.\n\n" + usage, parse_mode=ParseMode.HTML)
         return

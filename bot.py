@@ -1556,16 +1556,29 @@ def build_app() -> Application:
     return app
 
 
+def _ensure_event_loop() -> None:
+    # Python 3.12+ / 3.14 (Render default) has no loop on MainThread.
+    # python-telegram-bot 21 calls asyncio.get_event_loop() in run_polling.
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+
 def main() -> None:
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     start_health_server()
+    _ensure_event_loop()
     app = build_app()
     logger.info("RepoForge bot starting (polling)…")
     if not AUTHORIZED_USER_IDS:
         logger.warning(
             "AUTHORIZED_USER_IDS is empty — anyone who can message this bot can connect a GitHub token."
         )
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, stop_signals=None)
 
 
 if __name__ == "__main__":
